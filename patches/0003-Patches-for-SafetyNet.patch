@@ -1,0 +1,252 @@
+# PWD: frameworks/base
+From 8de7638956c6e45754d59a3b45657527099c10b0 Mon Sep 17 00:00:00 2001
+From: Danny Lin <danny@kdrag0n.dev>
+Date: Mon, 11 Oct 2021 19:59:51 -0700
+Subject: [PATCH] Patches for SafetyNet
+
+Spoof build fingerprint for Google Play Services
+
+SafetyNet's CTS profile attestation checks whether Build.FINGERPRINT
+matches that of the device's stock OS, which has passed CTS testing.
+Spoof the fingerprint for Google Play Services to help pass SafetyNet.
+
+We used to set the real system build fingerprint to the stock one, but
+Android relies on each build having a unique fingerprint in order to
+clear the correct caches and update persistent state for system changes.
+On devices that no longer receive updates from the OEM, the build
+fingerprint never changes and Android doesn't account for updates
+correctly, which causes issues when updating without wiping data.
+Only spoofing the fingerprint for Google Play Services fixes this issue.
+
+Corresponding vendor commit:
+"Only use stock build fingerprint for Google Play Services"
+
+NB: This code is under the gmscompat package, but it does not depend on
+any code from gmscompat.
+
+Change-Id: I26a2498eb2e2163933303b03f6d516e5fb30fe51
+
+keystore: Block key attestation for SafetyNet
+
+SafetyNet (part of Google Play Services) opportunistically uses
+hardware-backed key attestation via KeyStore as a strong integrity
+check. This causes SafetyNet to fail on custom ROMs because the verified
+boot key and bootloader unlock state can be detected from attestation
+certificates.
+
+As a workaround, we can take advantage of the fact that SafetyNet's
+usage of key attestation is opportunistic (i.e. falls back to basic
+integrity checks if it fails) and prevent it from getting the
+attestation certificate chain from KeyStore. This is done by checking
+the stack for DroidGuard, which is the codename for SafetyNet, and
+pretending that the device doesn't support key attestation.
+
+Key attestation has only been blocked for SafetyNet specifically, as
+Google Play Services and other apps have many valid reasons to use it.
+For example, it appears to be involved in Google's mobile security key
+ferature.
+
+Change-Id: I5146439d47f42dc6231cb45c4dab9f61540056f6
+
+Alter model name to avoid SafetyNet HW attestation enforcement
+
+As of September 2, Google is enforcing SafetyNet's previously
+opportunistic hardware-backed attestation based on device information.
+Append a space to the device model name in order to avoid such
+enforcement.
+
+Change-Id: Ib7779e0aae40cab3730a56785e9231896917ab0a
+
+Limit SafetyNet workarounds to unstable GMS process
+
+The unstable process is where SafetyNet attestation actually runs, so
+we only need to spoof the model in that process. Leaving other processes
+fixes various issues caused by model detection and flag provisioning,
+including screen-off Voice Match in Google Assistant, broken At a Glance
+weather and settings on Android 12, and more.
+
+Change-Id: Idcf663907a6c3d0408dbd45b1ac53c9eb4200df8
+---
+ core/java/android/app/Instrumentation.java    |  4 +
+ .../internal/gmscompat/AttestationHooks.java  | 85 +++++++++++++++++++
+ .../android/internal/gmshooks/GmsInfo.java    | 25 ++++++
+ .../keystore2/AndroidKeyStoreSpi.java         |  3 +
+ 4 files changed, 117 insertions(+)
+ create mode 100644 core/java/com/android/internal/gmscompat/AttestationHooks.java
+ create mode 100644 core/java/com/android/internal/gmshooks/GmsInfo.java
+
+diff --git a/core/java/android/app/Instrumentation.java b/core/java/android/app/Instrumentation.java
+index 8984c4292023..58258acaef97 100644
+--- a/core/java/android/app/Instrumentation.java
++++ b/core/java/android/app/Instrumentation.java
+@@ -57,6 +57,8 @@ import android.view.WindowManagerGlobal;
+ 
+ import com.android.internal.content.ReferrerIntent;
+ 
++import com.android.internal.gmscompat.AttestationHooks;
++
+ import java.io.File;
+ import java.lang.annotation.Retention;
+ import java.lang.annotation.RetentionPolicy;
+@@ -1231,6 +1233,7 @@ public class Instrumentation {
+         Application app = getFactory(context.getPackageName())
+                 .instantiateApplication(cl, className);
+         app.attach(context);
++        AttestationHooks.initApplicationBeforeOnCreate(app);
+         return app;
+     }
+     
+@@ -1248,6 +1251,7 @@ public class Instrumentation {
+             ClassNotFoundException {
+         Application app = (Application)clazz.newInstance();
+         app.attach(context);
++        AttestationHooks.initApplicationBeforeOnCreate(app);
+         return app;
+     }
+ 
+diff --git a/core/java/com/android/internal/gmscompat/AttestationHooks.java b/core/java/com/android/internal/gmscompat/AttestationHooks.java
+new file mode 100644
+index 000000000000..78754d28e6bb
+--- /dev/null
++++ b/core/java/com/android/internal/gmscompat/AttestationHooks.java
+@@ -0,0 +1,85 @@
++/*
++ * Copyright (C) 2021 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.internal.gmscompat;
++
++import android.app.Application;
++import android.os.Build;
++import android.os.SystemProperties;
++import android.util.Log;
++
++import java.lang.reflect.Field;
++import java.util.Arrays;
++
++/** @hide */
++public final class AttestationHooks {
++    private static final String TAG = "GmsCompat/Attestation";
++
++    private static final String PROCESS_UNSTABLE = "com.google.android.gms.unstable";
++
++    private static final String PRODUCT_STOCK_FINGERPRINT =
++            SystemProperties.get("ro.build.stock_fingerprint");
++
++    private static volatile boolean sIsGms = false;
++
++    private AttestationHooks() { }
++
++    private static void setBuildField(String key, String value) {
++        try {
++            // Unlock
++            Field field = Build.class.getDeclaredField(key);
++            field.setAccessible(true);
++
++            // Edit
++            field.set(null, value);
++
++            // Lock
++            field.setAccessible(false);
++        } catch (NoSuchFieldException | IllegalAccessException e) {
++            Log.e(TAG, "Failed to spoof Build." + key, e);
++        }
++    }
++
++    private static void spoofBuildGms() {
++        // Set fingerprint for SafetyNet CTS profile
++        if (PRODUCT_STOCK_FINGERPRINT.length() > 0) {
++            setBuildField("FINGERPRINT", PRODUCT_STOCK_FINGERPRINT);
++        }
++
++        // Alter model name to avoid hardware attestation enforcement
++        setBuildField("MODEL", Build.MODEL + " ");
++    }
++
++    public static void initApplicationBeforeOnCreate(Application app) {
++        if (GmsInfo.PACKAGE_GMS.equals(app.getPackageName()) &&
++                PROCESS_UNSTABLE.equals(Application.getProcessName())) {
++            sIsGms = true;
++            spoofBuildGms();
++        }
++    }
++
++    private static boolean isCallerSafetyNet() {
++        return Arrays.stream(Thread.currentThread().getStackTrace())
++                .anyMatch(elem -> elem.getClassName().contains("DroidGuard"));
++    }
++
++    public static void onEngineGetCertificateChain() {
++        // Check stack for SafetyNet
++        if (sIsGms && isCallerSafetyNet()) {
++            throw new UnsupportedOperationException();
++        }
++    }
++}
+diff --git a/core/java/com/android/internal/gmshooks/GmsInfo.java b/core/java/com/android/internal/gmshooks/GmsInfo.java
+new file mode 100644
+index 000000000000..84ac7389c756
+--- /dev/null
++++ b/core/java/com/android/internal/gmshooks/GmsInfo.java
+@@ -0,0 +1,25 @@
++/*
++ * Copyright (C) 2021 The Android Open Source Project
++ *
++ * Licensed under the Apache License, Version 2.0 (the "License");
++ * you may not use this file except in compliance with the License.
++ * You may obtain a copy of the License at
++ *
++ *      http://www.apache.org/licenses/LICENSE-2.0
++ *
++ * Unless required by applicable law or agreed to in writing, software
++ * distributed under the License is distributed on an "AS IS" BASIS,
++ * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ * See the License for the specific language governing permissions and
++ * limitations under the License.
++ */
++
++package com.android.internal.gmscompat;
++
++/** @hide */
++public final class GmsInfo {
++    // Package names for GMS apps
++    public static final String PACKAGE_GMS = "com.google.android.gms";
++
++    private GmsInfo() { }
++}
+diff --git a/keystore/java/android/security/keystore2/AndroidKeyStoreSpi.java b/keystore/java/android/security/keystore2/AndroidKeyStoreSpi.java
+index 33411e1ec5b9..133a4094d434 100644
+--- a/keystore/java/android/security/keystore2/AndroidKeyStoreSpi.java
++++ b/keystore/java/android/security/keystore2/AndroidKeyStoreSpi.java
+@@ -42,6 +42,7 @@ import android.system.keystore2.ResponseCode;
+ import android.util.Log;
+ 
+ import com.android.internal.annotations.VisibleForTesting;
++import com.android.internal.gmscompat.AttestationHooks;
+ 
+ import java.io.ByteArrayInputStream;
+ import java.io.IOException;
+@@ -164,6 +165,8 @@ public class AndroidKeyStoreSpi extends KeyStoreSpi {
+ 
+     @Override
+     public Certificate[] engineGetCertificateChain(String alias) {
++        AttestationHooks.onEngineGetCertificateChain();
++
+         KeyEntryResponse response = getKeyMetadata(alias);
+ 
+         if (response == null || response.metadata.certificate == null) {
+-- 
+2.34.1
+
